@@ -334,6 +334,7 @@ class Scheduler(SchedulerInterface):
         scheduled_resumed_reqs: list[Request] = []
         scheduled_running_reqs: list[Request] = []
         preempted_reqs: list[Request] = []
+        #print("[PAUL-VLLM] Scheduler.schedule() hit")
 
         req_to_new_blocks: dict[str, KVCacheBlocks] = {}
         num_scheduled_tokens: dict[str, int] = {}

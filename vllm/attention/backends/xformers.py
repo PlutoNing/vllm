@@ -377,6 +377,24 @@ class XFormersMetadataBuilder(CommonMetadataBuilder[XFormersMetadata]):
     _metadata_cls = XFormersMetadata
 
 
+"""
+LlamaAttention.forward()
+→ Attention.forward()
+→ XFormersImpl.forward()
+→ PagedAttention.write_to_paged_cache()
+→ ops.reshape_and_cache()
+→ torch.ops._C_cache_ops.reshape_and_cache
+→ CUDA reshape_and_cache_kernel
+=============================================
+XFormersImpl，XFormers backend 的具体实现，负责：
+接收已经计算好的 Q/K/V；
+把新 K/V 写入 KV Cache；
+prefill 时调用 xFormers 或 prefix attention；
+decode 时调用 vLLM Paged Attention；
+返回 attention output。
+
+注意：XFormersImpl 不负责产生 K/V，K/V 已经由 LlamaAttention.qkv_proj 
+计算完成。它负责缓存和使用 K/V。"""
 class XFormersImpl(AttentionImpl[XFormersMetadata]):
     """
     If the input tensors contain prompt tokens, the layout is as follows:
@@ -440,6 +458,11 @@ class XFormersImpl(AttentionImpl[XFormersMetadata]):
                 f"Head size {head_size} is not supported by PagedAttention. "
                 f"Supported head sizes are: {suppored_head_sizes}.")
 
+    """ XFormersImpl 自己执行 GPU 指令吗，不直接执行。它是 Python 控制代码：XFormersImpl.forward()
+→ 调用 PyTorch/xFormers/vLLM custom op
+→ custom op 提交 CUDA kernel
+→ GPU 执行
+它负责组织调用，不是 GPU kernel 本身。 """
     def forward(
         self,
         query: torch.Tensor,
@@ -548,11 +571,28 @@ class XFormersImpl(AttentionImpl[XFormersMetadata]):
                 # If kv_cache is not provided, the new key and value tensors are
                 # not cached. This happens during the initial memory
                 # profiling run.
+                """ 为什么这里写kvcache？我看到并列的调用这个方法的东西是rocm和torch sdpa，blocksparse attn相关
+                这些都是什么概念，什么层级的概念？"""
                 PagedAttention.write_to_paged_cache(key, value, key_cache,
                                                     value_cache,
                                                     updated_slot_mapping,
                                                     self.kv_cache_dtype,
                                                     k_scale, v_scale)
+                """ vLLM 不直接保存每个 token 的显存指针，而是保存逻辑映射：
+slot_idx
+→ physical block index
+→ block 内 offset
+→ 最终显存地址
+
+kernel 得到 KV Cache 的基地址后，通过偏移计算目标地址：
+目标地址 =
+KV Cache 基地址
++ physical_block × block_stride
++ head × head_stride
++ token_offset
++ head_element_offset
+
+"""
 
         if attn_type != AttentionType.ENCODER:
             # Decoder self-attention supports chunked prefill.
@@ -624,6 +664,19 @@ class XFormersImpl(AttentionImpl[XFormersMetadata]):
                 )
                 assert output[:num_prefill_tokens].shape == out.shape
                 output[:num_prefill_tokens] = out
+                """ 新 K/V 写入后，当前 Q 要和该请求所有历史 K 做点积：
+score = Q · Kᵀ / sqrt(head_size)
+prob  = softmax(score)
+output = prob · V
+但是历史 K/V 在物理显存中不一定连续。
+
+例如某个请求的逻辑 KV block：
+逻辑 block:  0   1   2
+物理 block: 17   4  29
+对应 block table：
+
+
+[17, 4, 29] """
 
         if decode_meta := attn_metadata.decode_metadata:
 

@@ -39,6 +39,14 @@ TypeCreateLogProbsFn = Callable[
     [TypeTokenIDs, TypeTopLogProbs, Optional[int], int], CompletionLogProbs]
 
 
+""" OpenAIServingCompletion 负责协议转换：
+校验模型名。
+对 prompt 进行 tokenizer 编码。
+把 HTTP 参数转换成 SamplingParams。
+ignore_eos 也进入 SamplingParams。
+生成 request ID。
+调用 AsyncLLMEngine.generate()。
+这里是“OpenAI HTTP 协议”到“vLLM 引擎内部协议”的边界。 """
 class OpenAIServingCompletion(OpenAIServing):
 
     def __init__(
@@ -60,6 +68,8 @@ class OpenAIServingCompletion(OpenAIServing):
                          request_logger=request_logger,
                          return_tokens_as_token_ids=return_tokens_as_token_ids)
 
+    """ OpenAIServingCompletion.create_completion()
+    处理 HTTP 请求，转换成引擎请求，返回结果。 """
     async def create_completion(
         self,
         request: CompletionRequest,
@@ -133,6 +143,7 @@ class OpenAIServingCompletion(OpenAIServing):
                         raw_request.headers):
                     log_tracing_disabled_warning()
 
+                """ 调用 AsyncLLMEngine.generate()，算是vLLM的引擎入口 """
                 generator = self.async_engine_client.generate(
                     {"prompt_token_ids": prompt_inputs["prompt_token_ids"]},
                     sampling_params,
@@ -212,6 +223,11 @@ class OpenAIServingCompletion(OpenAIServing):
 
         return response
 
+    """ 服务端输出格式类似：
+data: {"choices":[{"text":"Hello"}]}
+data: {"choices":[{"text":" world"}]}
+data: [DONE]
+服务端的 stream generator 把增量文本包装为 SSE """
     async def completion_stream_generator(
         self,
         request: CompletionRequest,

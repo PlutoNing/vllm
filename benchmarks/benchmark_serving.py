@@ -49,6 +49,7 @@ try:
 except ImportError:
     from argparse import ArgumentParser as FlexibleArgumentParser
 
+""" 生成请求并并发调用 HTTP 接口。 """
 
 @dataclass
 class BenchmarkMetrics:
@@ -194,6 +195,8 @@ def sample_sonnet_requests(
     return sampled_requests
 
 
+""" sample_random_requests() 生成：(prompt 文本, prompt token 数, 目标输出 token 数)
+这里是随机 token prompt，所以返回内容主要是“模型续写”，不是用于人类问答质量评估的答案。 """
 def sample_random_requests(
     prefix_len: int,
     input_len: int,
@@ -321,6 +324,7 @@ def calculate_metrics(
     return metrics, actual_output_lens
 
 
+""" benchmark() 正式压测 """
 async def benchmark(
     backend: str,
     api_url: str,
@@ -338,12 +342,14 @@ async def benchmark(
     selected_percentiles: List[str],
 ):
     if backend in ASYNC_REQUEST_FUNCS:
+        """ 根据backend，调用不同的请求函数 """
         request_func = ASYNC_REQUEST_FUNCS[backend]
     else:
         raise ValueError(f"Unknown backend: {backend}")
 
     print("Starting initial single prompt test run...")
     test_prompt, test_prompt_len, test_output_len = input_requests[0]
+    """ 发送单个请求，测试是否能正常工作 """
     test_input = RequestFuncInput(
         model=model_id,
         prompt=test_prompt,
@@ -384,6 +390,10 @@ async def benchmark(
 
     benchmark_start_time = time.perf_counter()
     tasks: List[asyncio.Task] = []
+    """ get_request()
+→ 为每个请求构造 RequestFuncInput
+→ asyncio.create_task(request_func(...))
+→ asyncio.gather(*tasks) """
     async for request in get_request(input_requests, request_rate):
         prompt, prompt_len, output_len = request
         request_func_input = RequestFuncInput(
@@ -423,6 +433,20 @@ async def benchmark(
 
     benchmark_duration = time.perf_counter() - benchmark_start_time
 
+    """ 计算压测结果，所有 HTTP task 完成后：asyncio.gather()
+→ calculate_metrics()
+→ 输出吞吐和延迟
+→ 保存 result-*.json
+计算内容包括：
+
+完成请求数
+输入/输出 token 数
+request/s
+output token/s
+TTFT
+TPOT
+ITL
+端到端延迟和分位数"""
     metrics, actual_output_lens = calculate_metrics(
         input_requests=input_requests,
         outputs=outputs,
@@ -505,6 +529,10 @@ async def benchmark(
     return result
 
 
+""" benchmark_serving.py main()
+→ 加载 tokenizer
+→ sample_random_requests()
+→ asyncio.run(benchmark()) """
 def main(args: argparse.Namespace):
     print(args)
     random.seed(args.seed)
@@ -521,6 +549,7 @@ def main(args: argparse.Namespace):
         api_url = f"http://{args.host}:{args.port}{args.endpoint}"
         base_url = f"http://{args.host}:{args.port}"
 
+    """ 加载 tokenizer """
     tokenizer = get_tokenizer(tokenizer_id,
                               trust_remote_code=args.trust_remote_code)
 
@@ -575,6 +604,9 @@ def main(args: argparse.Namespace):
                               for prompt, prompt_formatted, prompt_len,
                               output_len in input_requests]
 
+            """ 随机生成请求生成测试数据，sample_random_requests() 生成：
+        (prompt 文本, prompt token 数, 目标输出 token 数)
+        这里是随机 token prompt，所以返回内容主要是“模型续写”，不是用于人类问答质量评估的答案。 """
     elif args.dataset_name == "random":
         input_requests = sample_random_requests(
             prefix_len=args.random_prefix_len,
@@ -588,6 +620,7 @@ def main(args: argparse.Namespace):
     else:
         raise ValueError(f"Unknown dataset: {args.dataset_name}")
 
+    """ 正式压测 """
     benchmark_result = asyncio.run(
         benchmark(
             backend=backend,
@@ -668,6 +701,7 @@ if __name__ == "__main__":
     )
     parser.add_argument("--host", type=str, default="localhost")
     parser.add_argument("--port", type=int, default=8000)
+    """ vLLM OpenAI API Server：接收 /v1/completions，转换成引擎请求。 """
     parser.add_argument(
         "--endpoint",
         type=str,

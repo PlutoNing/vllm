@@ -168,6 +168,16 @@ class LlamaAttention(nn.Module):
                               cache_config=cache_config,
                               quant_config=quant_config)
 
+    """ 每层首先计算 Q、K、V，TinyLlama 的 attention 代码
+QKV 计算后，新 token 对应的 K/V 还只是临时 Tensor。
+vLLM 根据 slot_mapping 把它们写入该请求分配到的 KV block。
+调用链：LlamaAttention.forward()
+→ Attention.forward()
+→ XFormersImpl.forward()
+→ PagedAttention.write_to_paged_cache()
+→ ops.reshape_and_cache()
+→ torch.ops._C_cache_ops.reshape_and_cache
+→ CUDA reshape_and_cache_kernel"""
     def forward(
         self,
         positions: torch.Tensor,
@@ -206,6 +216,7 @@ class LlamaDecoderLayer(nn.Module):
         # Support internlm/internlm-7b with bias
         attention_bias = getattr(config, "attention_bias", False) or getattr(
             config, "bias", False)
+        """ 使用LlamaAttention类，初始化self_attn """
         self.self_attn = LlamaAttention(
             config=config,
             hidden_size=self.hidden_size,

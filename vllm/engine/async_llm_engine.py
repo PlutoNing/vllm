@@ -122,6 +122,7 @@ class RequestTracker:
     def __init__(self) -> None:
         self._request_streams: Dict[str, AsyncStream] = {}
         self._aborted_requests: asyncio.Queue[str] = asyncio.Queue()
+        """ 存放新请求的队列 """
         self._new_requests: asyncio.Queue[Tuple[AsyncStream,
                                                 dict]] = asyncio.Queue()
         self.new_requests_event = asyncio.Event()
@@ -178,6 +179,10 @@ class RequestTracker:
             logger.info("Finished request %s.", request_id)
         self.abort_request(request_id, exception=exception)
 
+    """ RequestTracker.add_request()
+    放入 _new_requests 队列
+    → new_requests_event.set()
+    每个请求还会创建一个 AsyncStream，后续引擎产生的结果通过它返回给 HTTP 层。 """
     def add_request(self,
                     request_id: str,
                     *,
@@ -189,12 +194,14 @@ class RequestTracker:
             raise KeyError(f"Request {request_id} already exists.")
 
         abort_request = partial(self.abort_request, verbose=verbose)
+        """ 创建一个用于返回结果的 AsyncStream """
         stream = AsyncStream(request_id, abort_request)
         self._new_requests.put_nowait((stream, {
             "request_id": request_id,
             **engine_add_request_kwargs
         }))
 
+        """ 加入新请求队列并唤醒 Engine """
         self.new_requests_event.set()
 
         if verbose:
@@ -241,6 +248,10 @@ class RequestTracker:
 
         return new_requests, finished_requests
 
+    """ run_engine_loop() 被唤醒，Engine 完全空闲时等待：await self._request_tracker.wait_for_new_requests()
+内部等待的是：await new_requests_event.wait()
+新请求调用 set() 后，后台循环被唤醒，并创建：asyncio.create_task(self.engine_step(virtual_engine))
+单卡、无流水线并行时，通常只有 virtual_engine=0。 """
     async def wait_for_new_requests(self):
         if not self.has_new_requests():
             await self.new_requests_event.wait()
@@ -256,6 +267,27 @@ class _AsyncLLMEngine(LLMEngine):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
+    """ 调用内层 step_async()
+    一次 step_async() 表示一次引擎调度/模型执行迭代。
+对于 decode 阶段，通常是为 batch 中每条活动序列生成下一个 token；
+对于 prefill 阶段，则处理 prompt token。
+一次 decode 的完整函数链
+
+AsyncLLMEngine.engine_step()
+→ _AsyncLLMEngine.step_async()
+→ Scheduler.schedule()
+→ ExecuteModelRequest
+→ GPUExecutorAsync.execute_model_async()
+→ Worker.execute_model()
+→ ModelRunner.prepare_model_input()
+→ Worker.execute_worker()                 # KV block 操作
+→ ModelRunner.execute_model()
+→ LlamaForCausalLM.forward()
+→ LlamaModel.forward()
+→ 22 × LlamaDecoderLayer.forward()
+→ compute_logits()
+→ sample()
+"""
     async def step_async(
         self, virtual_engine: int
     ) -> List[Union[RequestOutput, EmbeddingRequestOutput]]:
@@ -286,6 +318,7 @@ class _AsyncLLMEngine(LLMEngine):
         if not self._has_remaining_steps(seq_group_metadata_list):
 
             # Schedule iteration
+            """ 调度迭代，Scheduler 选择本轮 batch """
             (seq_group_metadata_list, scheduler_outputs,
              allow_async_output_proc
              ) = self.scheduler[virtual_engine].schedule()
@@ -319,6 +352,8 @@ class _AsyncLLMEngine(LLMEngine):
             last_sampled_token_ids = \
                 self._get_last_sampled_token_ids(virtual_engine)
 
+            """ 构造 ExecuteModelRequest
+调度结果被包装为  """
             execute_model_req = ExecuteModelRequest(
                 seq_group_metadata_list=seq_group_metadata_list,
                 blocks_to_swap_in=scheduler_outputs.blocks_to_swap_in,
@@ -399,6 +434,22 @@ class _AsyncLLMEngine(LLMEngine):
         """Stop the remote worker execution loop."""
         await self.model_executor.stop_remote_worker_execution_loop_async()
 
+    """ 添加请求到引擎，add_request_async() 把请求转换成调度对象
+调用层次：_AsyncLLMEngine.add_request_async()
+→ input_preprocessor.preprocess_async()
+→ input_processor()
+→ _add_processed_request()
+主要完成：
+校验 token 输入。
+创建 Sequence。
+根据 SamplingParams 创建 SequenceGroup。
+记录 request ID、到达时间、采样参数。
+加入 Scheduler。
+最终：min_cost_scheduler.add_seq_group(seq_group)
+这时请求才真正进入：Scheduler.waiting
+需要区分两个队列：
+RequestTracker._new_requests：async 包装层的暂存队列。
+Scheduler.waiting：模型调度层的等待队列。"""
     async def add_request_async(
         self,
         request_id: str,
@@ -440,6 +491,23 @@ class _AsyncLLMEngine(LLMEngine):
         self.model_executor.check_health()
 
 
+""" AsyncLLMEngine → Scheduler → GPU Executor：排队、调度、执行模型，再把结果逐步流回来
+存在两层 Engine：
+AsyncLLMEngine
+└── self.engine: _AsyncLLMEngine
+                    └── 继承 LLMEngine
+外层 AsyncLLMEngine 负责：
+asyncio 后台循环；
+请求通知；
+AsyncStream；
+把结果推给调用者。
+
+内层 _AsyncLLMEngine/LLMEngine 负责：
+Sequence/SequenceGroup；
+Scheduler；
+KV Cache；
+模型执行；
+停止条件和输出处理。"""
 class AsyncLLMEngine:
     """An asynchronous wrapper for :class:`LLMEngine`.
 
@@ -647,17 +715,32 @@ class AsyncLLMEngine:
             self._background_loop_unshielded = None
         self.background_loop = None
 
+    """ 有请求以后，后台循环执行：engine_step()
+→ 取出新请求
+→ 放进 LLMEngine waiting queue
+→ scheduler.schedule()
+→ model_executor.execute_model_async()
+→ Worker / ModelRunner
+→ GPU 执行模型
+引擎完成一个 step 后检查：
+哪些请求还需要继续生成；
+哪些请求已达到 max_tokens；
+哪些请求已结束；
+waiting 队列中哪些请求可以进入 active batch。
+只要还有活动请求，后台循环就继续调用 engine_step()；全部结束后重新等待 new_requests_event。 """
     async def engine_step(self, virtual_engine: int) -> bool:
         """Kick the engine to process the waiting requests.
 
         Returns True if there are in-progress requests."""
 
+        """ 外层 engine_step() 接收新请求 """
         new_requests, aborted_requests = (
             self._request_tracker.get_new_and_aborted_requests())
 
         for new_request in new_requests:
             # Add the request into the vLLM engine's waiting queue.
             try:
+                """ 取出来。然后逐个调用 """
                 await self.engine.add_request_async(**new_request)
             except ValueError as e:
                 # TODO: use a vLLM specific error for failed validation
@@ -670,6 +753,10 @@ class AsyncLLMEngine:
         if aborted_requests:
             await self._engine_abort(aborted_requests)
 
+        """ 调用内层 step_async()，外层随后调用：self.engine.step_async(virtual_engine)
+一次 step_async() 表示一次引擎调度/模型执行迭代。
+对于 decode 阶段，通常是为 batch 中每条活动序列生成下一个 token；
+对于 prefill 阶段，则处理 prompt token。 """
         request_outputs = await self.engine.step_async(virtual_engine)
 
         # Put the outputs into the corresponding streams.
@@ -683,8 +770,20 @@ class AsyncLLMEngine:
             all_finished = all(request_output.finished
                                for request_output in request_outputs)
 
+        """ engine_step() 返回：
+True：仍有请求需要处理
+False：本轮没有需要继续的请求 """
         return not all_finished
 
+    """ RequestOutput 回到 AsyncStream
+内层 step_async() 返回 RequestOutput，外层 engine_step() 调用：
+self._request_tracker.process_request_output(request_output)
+它根据 request_id 找到对应 AsyncStream：RequestOutput
+→ AsyncStream.put()
+如果请求完成，还会关闭 stream。
+此前 generate() 正在：async for output in await self.add_request(...):
+    yield output
+所以一旦 stream 中出现结果，generate() 就能继续向上游 yield。 """
     def process_request_outputs(self, request_outputs) -> bool:
         # Put the outputs into the corresponding streams.
         all_finished = True
@@ -698,6 +797,19 @@ class AsyncLLMEngine:
     async def _engine_abort(self, request_ids: Iterable[str]):
         self.engine.abort_request(request_ids)
 
+    """ Engine 空闲时等待什么
+Engine 有一个长期后台协程：run_engine_loop()
+没有请求时，它不是不断轮询，而是在 asyncio.Event 上休眠：
+async def wait_for_new_requests(self):
+    if not self.has_new_requests():
+        await self.new_requests_event.wait()
+    self.new_requests_event.clear()
+所以等待关系是：Engine 没有活动请求
+→ await new_requests_event.wait()
+→ benchmark 发来 HTTP 请求
+→ generate/add_request
+→ new_requests_event.set()
+→ Engine 被唤醒 """
     async def run_engine_loop(self):
         pipeline_parallel_size = \
                 self.engine.parallel_config.pipeline_parallel_size
@@ -712,6 +824,7 @@ class AsyncLLMEngine:
                 # they can process any other queued control plane messages,
                 # such as add/remove lora adapters.
                 await self.engine.stop_remote_worker_execution_loop_async()
+                """ Engine 完全空闲时等待： """
                 await self._request_tracker.wait_for_new_requests()
                 logger.debug("Got new requests!")
                 requests_in_progress = [
@@ -751,6 +864,12 @@ class AsyncLLMEngine:
 
     # This method does not need to be async, but kept that way
     # for backwards compatibility.
+    """ vllm engine接受请求的函数
+    HTTP 请求先进入 RequestTracker
+请求链路：RPC Server
+→ AsyncLLMEngine.generate()
+→ AsyncLLMEngine.add_request()
+→ RequestTracker.add_request()"""
     async def add_request(
         self,
         request_id: str,
@@ -771,6 +890,7 @@ class AsyncLLMEngine:
                     "error that caused the background loop to stop "
                     "(AsyncEngineDeadError).")
 
+        """ 每个请求还会创建一个 AsyncStream，后续引擎产生的结果通过它返回给 HTTP 层。 """
         stream = self._request_tracker.add_request(
             request_id,
             verbose=self.log_requests,
@@ -783,6 +903,14 @@ class AsyncLLMEngine:
 
         return stream.generator()
 
+    """  Engine 收到请求后如何等待
+调用层次是：AsyncLLMEngine.generate()
+→ add_request()
+→ RequestTracker.add_request()
+→ 放入 _new_requests 队列
+→ new_requests_event.set()
+每个请求还会创建一个 AsyncStream，后续引擎产生的结果通过它返回给 HTTP 层。
+"""
     async def generate(
         self,
         inputs: PromptInputs,

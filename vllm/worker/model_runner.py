@@ -692,6 +692,22 @@ class ModelInputForGPUBuilder(ModelRunnerInputBuilderBase[ModelInputForGPU]):
                 inter_data.mrope_input_positions[
                     seq_idx] = mrope_input_positions
 
+    """ 每个 SequenceGroup 仍然是 Engine/Scheduler 的 CPU 对象。
+它从中提取：
+当前需要计算的 token；
+token position；
+sequence length；
+已经计算过的 context length；
+query length；
+请求对应的 KV block table；
+prefix cache；
+LoRA/多模态信息。
+
+decode 时最关键的是：
+tokens = seq_data.get_last_token_id()
+context_len = seq_len - 1
+position = seq_len - 1
+也就是每个请求只取最新 token。 """
     def add_seq_group(self, seq_group_metadata: SequenceGroupMetadata):
         """Add a sequence group to the builder."""
         seq_ids = seq_group_metadata.seq_data.keys()
@@ -725,6 +741,37 @@ class ModelInputForGPUBuilder(ModelRunnerInputBuilderBase[ModelInputForGPU]):
                 and batch_size <= self.runner.max_batchsize_to_capture
                 and max_decode_seq_len <= self.runner.max_seq_len_to_capture)
 
+    """ 构建的不是模型，也不是 KV Cache，而是：
+将 Scheduler 选出的若干 SequenceGroup，整理成当前这一次 GPU forward 所需的 ModelInputForGPU。
+它把多个请求合并成一个 GPU batch：
+请求 0 最新 token
+请求 1 最新 token
+...
+请求 7 最新 token
+→ input_tokens [8]
+
+然后：
+flatten 所有 token 和 position；
+计算 batch size；
+判断是否需要 CUDA Graph padding；
+将 token、position 从 CPU 复制到 GPU；
+调用具体 attention metadata builder；
+构造 slot_mapping、block_tables、seq_lens_tensor；
+返回 ModelInputForGPU。
+
+核心结果类似：
+ModelInputForGPU
+├── input_tokens       CUDA Tensor [8]
+├── input_positions    CUDA Tensor [8]
+├── attn_metadata
+│   ├── slot_mapping
+│   ├── block_tables
+│   ├── seq_lens_tensor
+│   ├── prefill/decode 数量
+│   └── context/query lengths
+├── seq_lens
+├── query_lens
+└── LoRA/多模态信息"""
     def build(self) -> ModelInputForGPU:
         """Finalize the builder intermediate data and
         create on-device tensors.
@@ -798,6 +845,8 @@ class ModelInputForGPUBuilder(ModelRunnerInputBuilderBase[ModelInputForGPU]):
         if cuda_graph_pad_size:
             input_tokens.extend(itertools.repeat(0, cuda_graph_pad_size))
         assert self.runner.device is not None
+        """ 这个 builder 是：
+CPU Scheduler 数据结构 → 当前 GPU batch Tensor/metadata 的转换器。 """
         input_tokens_tensor = async_tensor_h2d(input_tokens, torch.long,
                                                self.runner.device,
                                                self.runner.pin_memory)
@@ -993,6 +1042,7 @@ class GPUModelRunnerBase(ModelRunnerBase[TModelInputForGPU]):
         self.sampling_metadata_cache: SamplingMetadataCache = \
             SamplingMetadataCache()
 
+    """ 加载模型 """
     def load_model(self) -> None:
         logger.info("Starting to load model %s...", self.model_config.model)
         with CudaMemoryProfiler() as m:
@@ -1097,6 +1147,18 @@ class GPUModelRunnerBase(ModelRunnerBase[TModelInputForGPU]):
         block_size = self.block_size
         return (self.max_seq_len_to_capture + block_size - 1) // block_size
 
+    """ Scheduler 的主要输出还是 Python/CPU 数据结构，例如：
+哪些请求本轮运行；每个请求当前 token；sequence length；block table；
+slot mapping；哪些 KV block 需要交换或复制。
+
+ModelRunner.prepare_model_input() 将这些内容整理为 Tensor：构造基础模型输入
+得到：
+
+input tokens；
+positions；
+attention metadata；
+seq/query lengths；
+LoRA/多模态信息。"""
     def _prepare_model_input_tensors(
         self,
         seq_group_metadata_list: List[SequenceGroupMetadata],
@@ -1122,8 +1184,24 @@ class GPUModelRunnerBase(ModelRunnerBase[TModelInputForGPU]):
 
         builder.reset_cached_inter_data()
 
+        """ 它构建的不是模型，也不是 KV Cache，而是：
+将 Scheduler 选出的若干 SequenceGroup，整理成当前这一次 GPU forward 所需的 ModelInputForGPU。 """
         return builder.build()  # type: ignore
 
+    """ 模型权重加载完成后，vLLM 会先进行一次最大负载 profile：
+ModelRunner.profile_run()
+→ 用最大 batch 的假数据运行一次前向
+→ 测量非 KV 部分的显存峰值
+→ 计算剩余显存能容纳多少 KV block
+→ CacheEngine 分配 KV Cache
+
+可分配 block 数大致按下面计算：
+总显存 × gpu_memory_utilization
+- 模型权重
+- 最大前向激活峰值
+- CUDA/PyTorch运行时占用
+= 可分配给 KV Cache 的显存
+然后 CacheEngine 为每个 attention layer 分配 KV tensor """
     @torch.inference_mode()
     def profile_run(self) -> None:
         # Enable top-k sampling to reflect the accurate memory usage.
@@ -1432,6 +1510,17 @@ class GPUModelRunnerBase(ModelRunnerBase[TModelInputForGPU]):
         return self.model_config.get_vocab_size()
 
 
+""" 结果如何返回，GPU 每生成一批新 token，结果沿反方向返回：ModelRunner
+→ LLMEngine RequestOutput
+→ RequestTracker
+→ AsyncStream
+→ OpenAIServingCompletion
+→ SSE
+→ aiohttp 客户端
+服务端输出格式类似：
+data: {"choices":[{"text":"Hello"}]}
+data: {"choices":[{"text":" world"}]}
+data: [DONE] """
 class ModelRunner(GPUModelRunnerBase[ModelInputForGPUWithSamplingMetadata]):
     """
     GPU model runner with sampling step.
@@ -1451,6 +1540,19 @@ class ModelRunner(GPUModelRunnerBase[ModelInputForGPUWithSamplingMetadata]):
             )
         return model_input
 
+    """ 在 Worker 中：prepare_input()
+├── prepare_worker_input()
+│   └── 准备 swap/copy block 映射
+└── model_runner.prepare_model_input()
+    └── 准备 token、position、block table、slot mapping
+
+execute_worker()
+└── 执行 KV Cache swap/copy
+
+model_runner.execute_model()
+└── 执行模型
+
+"""
     def prepare_model_input(
         self,
         seq_group_metadata_list: List[SequenceGroupMetadata],
@@ -1470,11 +1572,63 @@ class ModelRunner(GPUModelRunnerBase[ModelInputForGPUWithSamplingMetadata]):
 
         If cuda graph is required, this API automatically pads inputs.
         """
+        """ Scheduler 的主要输出还是 Python/CPU 数据结构，例如：
+
+哪些请求本轮运行；
+每个请求当前 token；
+sequence length；
+block table；
+slot mapping；
+哪些 KV block 需要交换或复制。
+ModelRunner.prepare_model_input() 将这些内容整理为 Tensor：
+
+
+input_tokens
+input_positions
+slot_mapping
+block_tables
+seq_lens
+sampling_metadata
+其中模型执行需要的 Tensor 最终在 CUDA device 上。
+
+这里并不是每轮搬运大量模型数据。每轮 CPU→GPU 的主要是少量：
+
+token ID；
+position；
+sequence length；
+block table；
+slot mapping；
+采样参数。
+真正大的模型权重和 KV Cache 已经驻留显存。
+请求拥有的 KV block 通常从 prefill 开始一直保留到请求结束。
+
+但显存中不是“每个请求一个独立大 KV Tensor”，而是：
+
+
+每一层一个大型共享 KV block 池
+→ 不同请求从池中分配不同 block
+例如：
+
+
+请求 A block table：[3, 7, 9]
+请求 B block table：[1, 5]
+请求 C block table：[2, 6, 8, 10]
+它们可以同时驻留，不需要整体切换。
+
+请求完成后：
+
+
+释放它占用的 block
+→ block 回到空闲池
+→ 后续请求复用
+如果有相同 prefix，还可能共享部分 block，并使用引用计数/COW。
+"""
         model_input = self._prepare_model_input_tensors(
             seq_group_metadata_list, finished_requests_ids)
         if get_pp_group().is_last_rank:
             # Sampling metadata is only required for the final pp group
             generators = self.get_generators(finished_requests_ids)
+            """ 构造 sampling metadata """
             sampling_metadata = SamplingMetadata.prepare(
                 seq_group_metadata_list, model_input.seq_lens,
                 model_input.query_lens, self.device, self.pin_memory,
@@ -1488,6 +1642,31 @@ class ModelRunner(GPUModelRunnerBase[ModelInputForGPUWithSamplingMetadata]):
                                    is_prompt=is_prompt,
                                    virtual_engine=virtual_engine)
 
+
+    """
+AsyncLLMEngine.engine_step()
+→ _AsyncLLMEngine.step_async()
+→ Scheduler.schedule()
+→ 构造 ExecuteModelRequest
+→ GPUExecutorAsync.execute_model_async()
+→ Worker.execute_model()
+→ ModelRunner.prepare_model_input()
+→ Worker.execute_worker()         # KV Cache swap/copy
+→ ModelRunner.execute_model()     # 当前代码
+=====================================================================
+Worker 在调用当前函数前，已经完成：
+将 Scheduler 结果转换成输入 tensor。
+准备 token、 position、 block table。
+按 Scheduler 指令操作 KV Cache。
+把真正可执行的 model_input 和 kv_caches 传进来。
+=====================================================================
+ModelRunner.execute_model() 主要做：
+准备 input tokens、 position、 attention metadata、 KV Cache
+→ model forward
+→ 得到 hidden states
+→ compute_logits()
+→ sample()
+→ 得到 SamplerOutput """
     @torch.inference_mode()
     @dump_input_when_exception(exclude_args=[0], exclude_kwargs=["self"])
     def execute_model(
@@ -1513,6 +1692,19 @@ class ModelRunner(GPUModelRunnerBase[ModelInputForGPUWithSamplingMetadata]):
                 model_input.prompt_adapter_requests,
                 model_input.prompt_adapter_mapping)
 
+        """ 开始模型前向计算
+         attention backend 的准备钩子
+        只是为本轮 attention 准备状态，还没有真正执行模型。
+        真正的模型前向入口是后面的 model_executable(...)
+        可能完成：
+设置当前 batch 的 attention 状态；
+准备 prefill/decode wrapper；
+绑定 block table；
+处理序列长度和 query 起始位置；
+为 CUDA Graph 选择对应状态。
+它本身通常不执行完整 Transformer 前向，只是在告诉 attention backend：
+
+本轮有哪些请求、哪些是 prefill、哪些是 decode、它们对应哪些 KV block。"""
         self.attn_state.begin_forward(model_input)
 
         # Currently cuda graph is only supported by the decode phase.
@@ -1522,6 +1714,7 @@ class ModelRunner(GPUModelRunnerBase[ModelInputForGPUWithSamplingMetadata]):
         # TODO(andoorve): We can remove this once all
         # virtual engines share the same kv cache.
         virtual_engine = model_input.virtual_engine
+        """ 选择普通执行还是 CUDA Graph """
         if prefill_meta is None and decode_meta.use_cuda_graph:
             assert model_input.input_tokens is not None
             graph_batch_size = model_input.input_tokens.shape[0]
@@ -1541,6 +1734,59 @@ class ModelRunner(GPUModelRunnerBase[ModelInputForGPUWithSamplingMetadata]):
             model_forward_end = torch.cuda.Event(enable_timing=True)
             model_forward_start.record()
 
+        """ 真正执行模型前向计算
+        model_executable 是 PyTorch nn.Module，所以语义上相当于：nn.Module.__call__()
+→ LlamaForCausalLM.forward()
+→ LlamaModel.forward()
+→ 每个 Transformer Layer
+
+对于 TinyLlama，内部大致执行：Embedding
+→ 多层：
+   RMSNorm
+   → QKV projection
+   → RoPE
+   → Attention，读取/写入 KV Cache
+   → Output projection
+   → RMSNorm
+   → MLP
+→ Final RMSNorm
+→ hidden states"""
+
+
+        """ 是不是“PyTorch 加载算子并计算”？
+大方向正确，但需要更精确。
+
+model_executable(...) 中的算子来源可能包括：
+
+PyTorch/ATen CUDA kernel；
+cuBLAS 矩阵乘法；
+xFormers attention kernel；
+vLLM 自定义 C++/CUDA kernel；
+fused RMSNorm、RoPE、sampling 等优化算子。
+PyTorch负责：
+
+nn.Module 调用机制；
+Tensor 与 dtype/device；
+算子 dispatch；
+CUDA stream；
+CUDA caching allocator；
+调用对应 CUDA kernel。
+vLLM负责：
+
+使用哪些模型层实现；
+如何组成 batch；
+哪些 token 本轮执行；
+KV Cache block table；
+选择 attention backend；
+调用自定义/融合算子；
+采样和输出处理。
+CUDA kernel 通常不是每一步重新从磁盘“加载”。相关扩展和库已经加载到进程，运行时主要是：
+
+
+PyTorch dispatcher 选择 kernel
+→ 把 kernel launch 放进 CUDA stream
+→ GPU 异步执行
+@torch.inference_mode() 则关闭 autograd，不保存反向传播需要的计算图和梯度。 """
         hidden_or_intermediate_states = model_executable(
             input_ids=model_input.input_tokens,
             positions=model_input.input_positions,
@@ -1574,6 +1820,25 @@ class ModelRunner(GPUModelRunnerBase[ModelInputForGPUWithSamplingMetadata]):
                     torch.tensor(model_forward_time + orig_model_forward_time))
             return hidden_or_intermediate_states
 
+        """ 此时得到的是 token ID、logprob 等内部结果，还不是 SSE 文本。 """
+        """ 过程是：
+
+
+hidden states
+→ lm_head
+→ vocabulary logits
+→ temperature/top-k/top-p 等处理
+→ sample
+→ 下一个 token ID
+你的测试中 temperature=0，通常等价于 greedy 选择最大 logits 对应的 token。
+
+随后 token ID 返回 LLMEngine，被：
+
+添加到 Sequence；
+detokenize 成文本；
+检查 max_tokens、EOS、stop；
+包装成 RequestOutput；
+最后通过 SSE 返回 benchmark。 """
         logits = self.model.compute_logits(hidden_or_intermediate_states,
                                            model_input.sampling_metadata)
 

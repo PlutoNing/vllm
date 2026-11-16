@@ -189,6 +189,11 @@ class AsyncEngineRPCServer:
         else:
             raise ValueError(f"Unknown RPCRequest type: {request}")
 
+    """ 子进程入口：run_server_loop()
+    → 等待 ZMQ 请求
+    → 处理请求
+    → 返回结果
+    实际持有模型和使用 CUDA 的是 Engine 子进程。 """
     async def run_server_loop(self):
         """Inner RPC Server Loop"""
 
@@ -209,6 +214,13 @@ class AsyncEngineRPCServer:
             task.add_done_callback(running_tasks.discard)
 
 
+""" 子进程入口：run_rpc_server()
+→ AsyncEngineRPCServer(...)
+→ AsyncLLMEngine.from_engine_args(...)
+→ 加载模型、初始化 KV Cache、GPU Executor
+→ run_server_loop()
+→ 等待 ZMQ 请求
+实际持有模型和使用 CUDA 的是 Engine 子进程。 """
 async def run_server(server: AsyncEngineRPCServer):
     # Put the server task into the asyncio loop.
     loop = asyncio.get_running_loop()
@@ -230,7 +242,7 @@ async def run_server(server: AsyncEngineRPCServer):
         # Clean up all resources.
         server.cleanup()
 
-
+# Engine 子进程的入口函数
 def run_rpc_server(async_engine_args: AsyncEngineArgs,
                    usage_context: UsageContext, rpc_path: str):
     server = AsyncEngineRPCServer(async_engine_args, usage_context, rpc_path)

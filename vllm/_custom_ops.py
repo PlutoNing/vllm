@@ -764,7 +764,77 @@ def topk_softmax(topk_weights: torch.Tensor, topk_ids: torch.Tensor,
     torch.ops._moe_C.topk_softmax(topk_weights, topk_ids,
                                   token_expert_indicies, gating_output)
 
+""" 为什么写 KV Cache 最底层是 CUDA kernel，不直接调用 OS/驱动/DMA？
+因为这里做的不是简单的连续内存复制，而是：
 
+
+读取新计算出的 K/V
+→ 根据 slot_mapping 找到物理 KV block
+→ 改变数据排列
+→ 可选 dtype 转换
+→ 分散写入不同显存地址
+这是带地址计算的数据重排，适合由 GPU thread 并行完成。
+
+调用链：
+
+
+PagedAttention.write_to_paged_cache()
+→ ops.reshape_and_cache()
+→ torch.ops._C_cache_ops.reshape_and_cache
+→ C++ CUDA launcher
+→ reshape_and_cache_kernel<<<...>>>()
+kernel 中每个 token 根据 slot_mapping 计算写入位置：
+
+
+slot_idx
+→ block_idx = slot_idx / block_size
+→ block_offset = slot_idx % block_size
+→ KV Cache 基地址 + block/head/token 偏移
+OS、驱动在哪里？
+它们在更底层：
+
+
+vLLM Python
+→ PyTorch custom op
+→ CUDA Runtime
+→ NVIDIA Driver
+→ GPU command queue
+→ GPU kernel
+→ GPU SM 执行显存写操作
+vLLM 不直接调用 Linux syscall 操作显存，因为：
+
+OS 不理解 vLLM 的 block table；
+OS 不知道 K/V 的 Tensor 布局；
+CPU 直接逐元素写 GPU 显存效率极低；
+CUDA Driver 已经负责显存映射、GPU 虚拟地址和命令提交。
+什么时候使用 DMA？
+如果只是 CPU/GPU 之间连续搬运 KV block，就使用 DMA：
+
+
+CPU KV Cache → GPU KV Cache：cudaMemcpyAsync HostToDevice
+GPU KV Cache → CPU KV Cache：cudaMemcpyAsync DeviceToHost
+对应 swap_blocks()。
+
+因此是两种情况：
+
+
+新 K/V 写入分页 Cache
+→ 数据重排/散写
+→ CUDA kernel
+完整 KV block 在 CPU/GPU 间搬运
+→ 连续复制
+→ cudaMemcpyAsync/DMA
+你的配置 --swap-space 0，所以通常只有第一种，没有 CPU/GPU KV swap。
+
+ """
+
+""" 调用链：LlamaAttention.forward()
+→ Attention.forward()
+→ XFormersImpl.forward()
+→ PagedAttention.write_to_paged_cache()
+→ ops.reshape_and_cache()
+→ torch.ops._C_cache_ops.reshape_and_cache
+→ CUDA reshape_and_cache_kernel"""
 def reshape_and_cache(
     key: torch.Tensor,
     value: torch.Tensor,

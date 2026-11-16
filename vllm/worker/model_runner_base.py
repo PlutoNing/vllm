@@ -185,6 +185,33 @@ class ModelRunnerInputBuilderBase(ABC, Generic[T]):
         raise NotImplementedError
 
 
+""" Worker
+代表一个 GPU 执行单元，负责：
+
+初始化 CUDA device；
+加载模型；
+分配 KV Cache；
+准备输入；
+执行 KV swap/copy；
+调用 ModelRunner。
+ModelRunner
+具体的 GPU 模型运行器：
+
+创建并加载模型；
+将 SequenceGroup 转成 GPU Tensor；
+执行模型 forward；
+compute logits；
+sample。
+ModelInputForGPUBuilder
+把 Scheduler 的 CPU metadata 转为本轮 GPU batch 输入。
+
+CacheEngine
+管理整块 KV Cache：
+
+GPU KV Cache；
+可选 CPU KV Cache；
+swap in/out；
+GPU block copy。 """
 class ModelRunnerBase(ABC, Generic[T]):
     """
     Model runner interface that abstracts a particular hardware and/or type of

@@ -1101,6 +1101,30 @@ class Scheduler:
             and not seq_group.sampling_params.use_beam_search)
         return no_beam_search
 
+    """ 调度迭代，Scheduler 选择本轮 batch
+    Scheduler 维护的主要状态包括：
+waiting：尚未开始
+running：正在生成
+swapped：因 KV Cache 压力被换出
+
+它根据以下约束选择本轮请求：
+--max-num-seqs=8
+--max-num-batched-tokens=2048
+KV Cache 空闲 block
+prefill/decode 状态
+请求到达顺序
+是否需要抢占或 swap
+返回：
+seq_group_metadata_list
+scheduler_outputs
+allow_async_output_proc
+其中 scheduler_outputs 描述：
+
+本轮执行哪些 SequenceGroup；
+哪些 KV block 需要 swap in/out；
+哪些 block 需要复制；
+batch token 数；
+哪些请求被抢占。"""
     def schedule(
             self
     ) -> Tuple[List[SequenceGroupMetadata], SchedulerOutputs, bool]:

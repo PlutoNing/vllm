@@ -12,6 +12,19 @@ from vllm.utils import (STR_DTYPE_TO_TORCH_DTYPE, get_dtype_size,
 logger = init_logger(__name__)
 
 
+""" 启用 CPU KV swap，如果设置了：--swap-space N
+vLLM 会在 CPU pinned memory 中分配 CPU KV Cache。
+当显存 KV block 不足时，Scheduler 可能产生：
+blocks_to_swap_out = [(gpu_block, cpu_block), ...]
+blocks_to_swap_in  = [(cpu_block, gpu_block), ...]
+调用链：Scheduler.schedule()
+→ ExecuteModelRequest.blocks_to_swap_in/out
+→ Worker.prepare_worker_input()
+→ Worker.execute_worker()
+→ CacheEngine.swap_in/swap_out()
+→ PagedAttention.swap_blocks()
+→ torch.ops._C_cache_ops.swap_blocks
+→ cudaMemcpyAsync() """
 class CacheEngine:
     """Manages the KV cache.
 

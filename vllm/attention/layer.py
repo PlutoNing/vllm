@@ -12,6 +12,7 @@ from vllm.model_executor.layers.quantization.base_config import (
 from vllm.model_executor.layers.quantization.kv_cache import BaseKVCacheMethod
 
 
+""" 各种 attention的基类？"""
 class Attention(nn.Module):
     """Attention layer.
 

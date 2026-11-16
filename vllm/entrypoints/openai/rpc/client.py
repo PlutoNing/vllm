@@ -45,6 +45,12 @@ class RPCClientClosedError(Exception):
     """
 
 
+""" 创建 ZMQ 地址和 RPC Client，get_open_zmq_ipc_path()
+→ 生成本地 IPC 地址
+→ AsyncEngineRPCClient(rpc_path)
+RPC Client 实现了与 AsyncLLMEngine 相似的接口，例如：generate()
+abort()，get_model_config()，check_health()
+因此 FastAPI 上层不需要知道拿到的是“真实 Engine”还是“RPC 代理”。 """
 class AsyncEngineRPCClient:
     """
     RPCClient that connects to the RPCServer wrapping AsyncLLMEngine.
@@ -148,6 +154,14 @@ class AsyncEngineRPCClient:
             frames = await socket_from.recv_multipart(copy=False)
             await socket_to.send_multipart(frames, copy=False)
 
+    """ 等待 Engine 就绪
+API 主进程调用：await rpc_client.setup()
+它会：
+向 Engine 子进程发送 readiness 请求。
+等待 Engine 完成模型初始化。
+获取模型、并行、调度器、LoRA 等配置。
+在 API 进程创建 tokenizer group。
+如果 RPC 超时，会检查 Engine 子进程是否仍存活。 """
     async def setup(self):
         """Setup the client before it starts sending server requests."""
 

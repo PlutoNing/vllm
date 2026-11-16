@@ -127,6 +127,45 @@ class UnquantizedLinearMethod(LinearMethodBase):
         layer.register_parameter("weight", weight)
         set_weight_attrs(weight, extra_weight_attrs)
 
+    """ 未量化线性层最终调用
+    F.linear() 根据：tensor 在 CUDA；dtype 是 FP16；shape 和 stride；
+由 PyTorch dispatcher 选择 CUDA 实现，通常进一步调用 cuBLAS/cuBLASLt GEMM。
+P40 没有 Tensor Core，但仍然可以通过 CUDA Core 执行这些矩阵运算。
+它是所有“未量化线性层”的通用计算策略，不只对应某一个步骤。
+
+可能用于：
+
+QKV projection；
+Attention output projection；
+MLP gate/up projection；
+MLP down projection；
+lm_head。
+例如 TinyLlama QKV：
+
+
+x:       [8, 2048]
+weight:  [2560, 2048]
+F.linear(x, weight)
+等价于：
+[8, 2048] × [2048, 2560]
+→ [8, 2560]
+对于 MLP gate/up：
+
+
+[8, 2048] × [2048, 11264]
+→ [8, 11264]
+UnquantizedLinearMethod 是策略类：
+
+
+没有量化 → UnquantizedLinearMethod → F.linear
+INT8/FP8/GPTQ → 对应 QuantizationMethod → 特定 kernel
+F.linear() 根据 Tensor 的：
+
+device：CUDA；
+dtype：FP16；
+shape/stride；
+通过 PyTorch dispatcher 选择 CUDA 实现，通常落到 cuBLAS/cuBLASLt GEMM。
+"""
     def apply(self,
               layer: torch.nn.Module,
               x: torch.Tensor,

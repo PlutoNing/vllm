@@ -148,6 +148,14 @@ class SamplingMetadata:
         self.skip_sampler_cpu_output = skip_sampler_cpu_output
         self.reuse_sampling_tensors = reuse_sampling_tensors
 
+    """ 构造 sampling metadata
+    包含：
+temperature；
+top-k/top-p；
+logprobs；
+greedy/random 类型；
+哪些 batch 行需要采样；
+RNG generator。"""
     @staticmethod
     def prepare(
         seq_group_metadata_list: List[SequenceGroupMetadata],

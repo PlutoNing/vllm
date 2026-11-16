@@ -30,6 +30,16 @@ class PagedAttentionMetadata:
     block_tables: Optional[torch.Tensor]
 
 
+""" PagedAttention 基本是无状态工具类，方法都是静态方法：
+PagedAttention.write_to_paged_cache(...)
+PagedAttention.forward_decode(...)
+PagedAttention.split_kv_cache(...)
+============================================================
+状态放在哪里？
+KV 数据：kv_cache Tensor；
+请求映射：block_tables、 slot_mapping；
+序列长度：seq_lens；
+固定配置：XFormersImpl 的 head size、 head 数等。 """
 class PagedAttention:
 
     @staticmethod
@@ -61,6 +71,7 @@ class PagedAttention:
         value_cache = value_cache.view(num_blocks, num_kv_heads, head_size, -1)
         return key_cache, value_cache
 
+    """ 写回kvcache的实现 """
     @staticmethod
     def write_to_paged_cache(
         key: torch.Tensor,
@@ -82,7 +93,17 @@ class PagedAttention:
             k_scale,
             v_scale,
         )
+    """ 进一步调用：
 
+
+PagedAttention.forward_decode()
+→ ops.paged_attention_v1/v2()
+→ torch.ops._C.paged_attention_v1/v2
+→ CUDA paged_attention_kernel
+CUDA kernel 中，通过 block table 找到真实物理 block
+这就是 GPU kernel 的“寻址”。
+k_cache 是显存基地址，physical_block_number 来自 vLLM 构造的 
+block table，kernel 用指针运算得到需要读取的 K/V 地址。"""
     @staticmethod
     def forward_decode(
         query: torch.Tensor,

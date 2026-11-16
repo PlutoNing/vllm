@@ -95,6 +95,7 @@ async def lifespan(app: FastAPI):
     yield
 
 
+""" 这里构建vllm的engine """
 @asynccontextmanager
 async def build_async_engine_client(
         args: Namespace) -> AsyncIterator[Optional[AsyncEngineClient]]:
@@ -114,6 +115,10 @@ async def build_async_engine_client(
         yield engine
 
 
+""" 这里构建vllm的engine；run_server()
+→ build_async_engine_client(args)
+→ AsyncEngineArgs.from_cli_args(args)
+→ build_async_engine_client_from_engine_args(...)"""
 @asynccontextmanager
 async def build_async_engine_client_from_engine_args(
     engine_args: AsyncEngineArgs,
@@ -129,6 +134,13 @@ async def build_async_engine_client_from_engine_args(
 
     # If manually triggered or embedding model, use AsyncLLMEngine in process.
     # TODO: support embedding model via RPC.
+    """ 方式 A：API 与 Engine 同进程
+    执行：API Server 进程
+├── FastAPI/Uvicorn
+└── AsyncLLMEngine
+直接调用：engine_client = AsyncLLMEngine.from_engine_args(...)
+yield engine_client
+HTTP 层调用 async_engine_client.generate() 时，就是直接调用同进程里的 AsyncLLMEngine.generate()。"""
     if (model_is_embedding(engine_args.model, engine_args.trust_remote_code,
                            engine_args.quantization)
             or disable_frontend_multiprocessing):
@@ -141,6 +153,17 @@ async def build_async_engine_client_from_engine_args(
         return
 
     # Otherwise, use the multiprocessing AsyncLLMEngine.
+     # 方式 B：API 与 Engine 分进程
+#     没有设置 --disable-frontend-multiprocessing，因此走这条默认路径：
+# API Server 主进程
+# ├── Uvicorn/FastAPI
+# └── AsyncEngineRPCClient
+#         │ ZMQ IPC
+#         ▼
+# Engine 子进程
+# └── AsyncEngineRPCServer
+#     └── AsyncLLMEngine
+#         └── LLMEngine/模型/GPU
     else:
         if "PROMETHEUS_MULTIPROC_DIR" not in os.environ:
             # Make TemporaryDirectory for prometheus multiprocessing
@@ -158,6 +181,7 @@ async def build_async_engine_client_from_engine_args(
                 "and vLLM will properly handle cleanup.")
 
         # Select random path for IPC.
+        """ 创建 ZMQ 地址和 RPC Client """
         rpc_path = get_open_zmq_ipc_path()
         logger.info("Multiprocessing frontend to use %s for RPC Path.",
                     rpc_path)
@@ -165,12 +189,14 @@ async def build_async_engine_client_from_engine_args(
         # Build RPCClient, which conforms to AsyncEngineClient Protocol.
         # NOTE: Actually, this is not true yet. We still need to support
         # embedding models via RPC (see TODO above)
+        # RPC Client 实现了与 AsyncLLMEngine 相似的接口
         rpc_client = AsyncEngineRPCClient(rpc_path)
 
         # Start RPCServer in separate process (holds the AsyncLLMEngine).
         context = multiprocessing.get_context("spawn")
         # the current process might have CUDA context,
         # so we need to spawn a new process
+        """ spawn Engine 子进程 """
         rpc_server_process = context.Process(
             target=run_rpc_server,
             args=(engine_args, UsageContext.OPENAI_API_SERVER, rpc_path))
@@ -181,6 +207,7 @@ async def build_async_engine_client_from_engine_args(
         try:
             while True:
                 try:
+                    """ 等待 Engine 就绪 """
                     await rpc_client.setup()
                     break
                 except TimeoutError:
@@ -299,6 +326,10 @@ async def create_chat_completion(request: ChatCompletionRequest,
     return StreamingResponse(content=generator, media_type="text/event-stream")
 
 
+""" HTTP 请求进入 vLLM 后发生什么
+FastAPI 路由层次是：POST /v1/completions
+→ api_server.create_completion()
+→ OpenAIServingCompletion.create_completion() """
 @router.post("/v1/completions")
 async def create_completion(request: CompletionRequest, raw_request: Request):
     generator = await openai_serving_completion.create_completion(
@@ -491,10 +522,26 @@ async def init_app(
     return app
 
 
+""" run_benchmark.sh的start_server() 通过 systemd-run 启动一个独立 service，
+最终执行：python -m vllm.entrypoints.openai.api_server
+入口调用层次是：
+api_server.py __main__
+→ run_server()
+→ build_async_engine_client()
+→ 创建 AsyncLLMEngine
+→ init_app()
+→ 创建 FastAPI 路由
+→ serve_http()
+→ Uvicorn 开始监听 8000
+在 vLLM 0.6.1 默认配置下，前端和引擎是分进程的：
+API Server 进程：Uvicorn + FastAPI，负责 HTTP。
+Engine 进程：持有 AsyncLLMEngine 和模型。
+两者通过 ZMQ RPC 通信。单卡 P40 最终只有一条 GPU 模型执行路径。"""
 async def run_server(args, **uvicorn_kwargs) -> None:
     logger.info("vLLM API server version %s", VLLM_VERSION)
     logger.info("args: %s", args)
 
+    # 这里构建vllm的engine
     async with build_async_engine_client(args) as async_engine_client:
         # If None, creation of the client failed and we exit.
         if async_engine_client is None:

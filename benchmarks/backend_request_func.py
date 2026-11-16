@@ -220,6 +220,9 @@ async def async_request_deepspeed_mii(
         return output
 
 
+""" async_request_openai_completions() 处理 OpenAI Completions API 请求
+压测时指定 --backend vllm 时，调用这个函数
+把RequestFuncInput转换成OpenAI Completions API请求的payload"""
 async def async_request_openai_completions(
     request_func_input: RequestFuncInput,
     pbar: Optional[tqdm] = None,
@@ -417,6 +420,8 @@ def get_tokenizer(
                                          trust_remote_code=trust_remote_code)
 
 
+""" 不同后端请求函数的映射
+就是说，不同的后端，调用不同的请求函数"""
 ASYNC_REQUEST_FUNCS = {
     "tgi": async_request_tgi,
     "vllm": async_request_openai_completions,

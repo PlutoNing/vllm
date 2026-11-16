@@ -29,6 +29,7 @@ class GPUExecutor(ExecutorBase):
 
     uses_ray: bool = False
 
+    """ 单卡下，GPUExecutor 创建一个 Worker """
     def _init_executor(self) -> None:
         """Initialize the worker and load the model.
         """
@@ -124,6 +125,13 @@ class GPUExecutor(ExecutorBase):
 
         self.driver_worker.initialize_cache(num_gpu_blocks, num_cpu_blocks)
 
+    """ ModelRunner.execute_model() 主要做：
+准备 input tokens、position、attention metadata、KV Cache
+→ model forward
+→ 得到 hidden states
+→ compute_logits()
+→ sample()
+→ 得到 SamplerOutput """
     def execute_model(
         self, execute_model_req: ExecuteModelRequest
     ) -> Optional[List[Union[SamplerOutput, PoolerOutput]]]:
@@ -176,6 +184,24 @@ class GPUExecutor(ExecutorBase):
         self.driver_worker.stop_profile()
 
 
+""" GPU Executor 调用 Worker/ModelRunner
+执行：outputs = await self.model_executor.execute_model_async(
+    execute_model_req
+)
+层次大致是：
+Model Executor
+→ Worker
+→ 准备 ModelInput
+→ ModelRunner.execute_model()
+ModelRunner.execute_model() 主要做：
+
+
+准备 input tokens、position、attention metadata、KV Cache
+→ model forward
+→ 得到 hidden states
+→ compute_logits()
+→ sample()
+→ 得到 SamplerOutput """
 class GPUExecutorAsync(GPUExecutor, ExecutorAsyncBase):
 
     async def execute_model_async(

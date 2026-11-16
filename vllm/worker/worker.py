@@ -322,6 +322,22 @@ class Worker(LocalOrDistributedWorkerBase):
             num_steps=num_steps,
         )
 
+    """ 每次执行前如何管理 KV Cache
+Scheduler 返回三类操作：
+blocks_to_swap_in
+blocks_to_swap_out
+blocks_to_copy
+Worker 在模型前向前执行execute_worker
+====================================
+脚本设置了：--swap-space 0
+所以这套实验通常不会把 KV Cache 在 CPU 和 GPU 之间来回 swap。
+
+主要行为是：
+GPU KV Cache 一直常驻显存；
+vLLM 给请求分配、回收 KV block；
+用 block table 建立“逻辑 token 位置 → 物理 KV block”映射；
+attention kernel 按 block table 查找已有 K/V；
+新 token 的 K/V 直接写入已分配位置。"""
     @torch.inference_mode()
     def execute_worker(self, worker_input: WorkerInput) -> None:
         virtual_engine = worker_input.virtual_engine

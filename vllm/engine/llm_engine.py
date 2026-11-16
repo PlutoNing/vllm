@@ -881,6 +881,21 @@ class LLMEngine:
 
         return
 
+    """ 处理模型输出和停止条件
+模型结果回到 _process_model_outputs()：
+SamplerOutput
+→ 找到对应 SequenceGroup
+→ token 加入 Sequence
+→ detokenize
+→ 检查停止条件
+→ 创建 RequestOutput
+停止条件由 StopChecker 判断：
+
+EOS；
+stop token；
+stop string；
+max_model_len；
+max_tokens。 """
     def _process_model_outputs(self,
                                ctx: SchedulerContext,
                                request_id: Optional[str] = None) -> None:

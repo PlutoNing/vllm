@@ -1232,6 +1232,11 @@ class HiddenStates(msgspec.Struct, array_like=True,
             [self.hidden_states, self.second_last_token_hidden_states])[index]
 
 
+""" 
+构造 ExecuteModelRequest
+调度结果被包装为ExecuteModelRequest
+这是 Scheduler 与 GPU Executor 之间的内部接口。
+它不再包含 HTTP 概念，只包含本轮模型执行所需要的序列、KV Cache 和并行信息。 """
 class ExecuteModelRequest(
         msgspec.Struct,
         array_like=True,  # type: ignore[call-arg]

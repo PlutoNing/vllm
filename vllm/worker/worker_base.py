@@ -292,6 +292,10 @@ class LocalOrDistributedWorkerBase(WorkerBase):
         else:
             return self._get_worker_input_from_broadcast()
 
+    """ 调用位置在 Worker：Worker.execute_model()
+→ prepare_input()
+→ _get_driver_input_and_broadcast()
+→ self.model_runner.prepare_model_input() """
     def execute_model(
         self,
         execute_model_req: Optional[ExecuteModelRequest] = None,
@@ -324,6 +328,10 @@ class LocalOrDistributedWorkerBase(WorkerBase):
                 orig_model_execute_time = intermediate_tensors.tensors.get(
                     "model_execute_time", torch.tensor(0)).item()
 
+        """ KV Cache 是另一个参数
+        模型执行输入分成两部分：
+model_input：本轮 token、位置、block table、采样信息
+kv_caches：启动时预分配、跨请求/跨 decode 保留的大型 GPU Ca"""
         output = self.model_runner.execute_model(
             model_input=model_input,
             kv_caches=self.kv_cache[worker_input.virtual_engine]
